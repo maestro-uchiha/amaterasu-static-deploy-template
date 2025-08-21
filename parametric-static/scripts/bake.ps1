@@ -1,94 +1,112 @@
-<#
-Amaterasu Static Deploy (ASD) — Bake Script
-#>
-
-Write-Host "[Amaterasu Static Deploy] Baking…"
-
-# ===== Inputs / defaults (CLI args override bake-config.json) =====
 param(
-    [string]$Brand,
-    [string]$Money
+  [string]$Brand = "Amaterasu Static Deploy",
+  [string]$Money = "https://example.com"
 )
 
-if (-not $Brand -and (Test-Path "bake-config.json")) {
-    $conf = Get-Content "bake-config.json" -Raw | ConvertFrom-Json
-    $Brand = $conf.brand
-    $Money = $conf.url
-}
+Write-Host "[ASD] Baking site for brand: $Brand, money site: $Money"
 
-if (-not $Brand) { $Brand = "{{BRAND}}" }
-if (-not $Money) { $Money = "https://YOUR-DOMAIN.com" }
+# Load from bake-config.json if args not passed
+if ((-not $PSBoundParameters.ContainsKey('Brand') -or -not $PSBoundParameters.ContainsKey('Money')) -and (Test-Path "bake-config.json")) {
+  $cfg = Get-Content "bake-config.json" -Raw | ConvertFrom-Json
+  if (-not $PSBoundParameters.ContainsKey('Brand') -and $cfg.brand) { $Brand = $cfg.brand }
+  if (-not $PSBoundParameters.ContainsKey('Money') -and $cfg.url)   { $Money = $cfg.url }
+}
 $Year = (Get-Date).Year
 
-Write-Host "[ASD] BRAND='$Brand' MONEY='$Money' YEAR=$Year"
+# Load partials
+$headPartial = Get-Content "partials/head-seo.html" -Raw
+$navPartial  = Get-Content "partials/nav.html" -Raw
+$footPartial = Get-Content "partials/footer.html" -Raw
 
-# ===== Load partials =====
-$HeadPartial = Get-Content "partials/head-seo.html" -Raw
-$NavPartial  = Get-Content "partials/nav.html" -Raw
-$FootPartial = Get-Content "partials/footer.html" -Raw
-
-# ===== Replacement function =====
-function Bake-File($file) {
-    if (-not (Test-Path $file)) { return }
-
-    $content = Get-Content $file -Raw
-    $content = $content -replace '<!--#include virtual="partials/head-seo.html" -->', $HeadPartial
-    $content = $content -replace '<!--#include virtual="partials/nav.html" -->', $NavPartial
-    $content = $content -replace '<!--#include virtual="partials/footer.html" -->', $FootPartial
-    $content = $content -replace '\{\{BRAND\}\}', $Brand
-    $content = $content -replace '\{\{MONEY\}\}', $Money
-    $content = $content -replace '\{\{YEAR\}\}', $Year
-
-    Set-Content $file $content
-    Write-Host "[ASD] Baked $file"
+function Apply-Template {
+  param([string]$Path)
+  if (-not (Test-Path $Path)) { return }
+  $html = Get-Content $Path -Raw
+  # includes
+  $html = $html -replace '<!--#include virtual="partials/head-seo.html" -->', $headPartial
+  $html = $html -replace '<!--#include virtual="partials/nav.html" -->',  $navPartial
+  $html = $html -replace '<!--#include virtual="partials/footer.html" -->', $footPartial
+  # tokens
+  $html = $html -replace '\{\{BRAND\}\}', $Brand
+  $html = $html -replace '\{\{MONEY\}\}', $Money
+  $html = $html -replace '\{\{YEAR\}\}',  $Year
+  Set-Content -Encoding UTF8 $Path $html
+  Write-Host "[ASD] Baked $Path"
 }
 
-# ===== Process root HTML files =====
-foreach ($f in @("index.html","about.html","contact.html","sitemap.html","404.html")) {
-    Bake-File $f
+# Root pages
+@("index.html","about.html","contact.html","sitemap.html","404.html") | ForEach-Object { Apply-Template $_ }
+# Legal pages
+@("legal/privacy.html","legal/terms.html","legal/disclaimer.html")    | ForEach-Object { Apply-Template $_ }
+# Blog posts
+if (Test-Path "blog") { Get-ChildItem -Path "blog" -Filter *.html -File | ForEach-Object { Apply-Template $_.FullName } }
+
+# ---- Update config.json (supports nested site.*, author.*; keeps legacy keys) ----
+$cfgPath = "config.json"
+if (Test-Path $cfgPath) {
+  try { $c = Get-Content $cfgPath -Raw | ConvertFrom-Json -ErrorAction Stop }
+  catch { Write-Host "[ASD] config.json invalid JSON; rebuilding."; $c = [pscustomobject]@{} }
+} else { $c = [pscustomobject]@{} }
+
+if (-not ($c | Get-Member -Name site   -MemberType NoteProperty)) { $c | Add-Member -NotePropertyName site   -NotePropertyValue ([pscustomobject]@{}) }
+if (-not ($c | Get-Member -Name author -MemberType NoteProperty)) { $c | Add-Member -NotePropertyName author -NotePropertyValue ([pscustomobject]@{}) }
+
+# site.name/url/description (do not force url; clear placeholder if present)
+$desc = $null
+if ($c.site.PSObject.Properties.Name -contains 'description' -and $c.site.description) {
+  $desc = ($c.site.description -replace '\{\{BRAND\}\}', $Brand)
+} else {
+  $desc = ("Premium {0} - quality, reliability, trust." -f $Brand)
+}
+$c.site.name        = $Brand
+if (-not ($c.site.PSObject.Properties.Name -contains 'url')) {
+  $c.site | Add-Member -NotePropertyName url -NotePropertyValue ""
+} elseif ($c.site.url -match 'YOUR-DOMAIN\.example') {
+  $c.site.url = ""
+}
+$c.site.description = $desc
+
+# author.name: replace {{BRAND}} if present; keep email if present
+if ($c.author.PSObject.Properties.Name -contains 'name' -and $c.author.name) {
+  $c.author.name = ($c.author.name -replace '\{\{BRAND\}\}', $Brand)
+} else {
+  if (-not ($c.author.PSObject.Properties.Name -contains 'name')) {
+    $c.author | Add-Member -NotePropertyName name -NotePropertyValue ("{0} Team" -f $Brand)
+  } else { $c.author.name = ("{0} Team" -f $Brand) }
 }
 
-# ===== Process legal pages =====
-foreach ($f in @("legal/privacy.html","legal/terms.html","legal/disclaimer.html")) {
-    Bake-File $f
+# legacy keys (harmless for compat)
+if (-not ($c | Get-Member -Name brand     -MemberType NoteProperty)) { Add-Member -InputObject $c -NotePropertyName brand     -NotePropertyValue $Brand } else { $c.brand     = $Brand }
+if (-not ($c | Get-Member -Name moneySite -MemberType NoteProperty)) { Add-Member -InputObject $c -NotePropertyName moneySite -NotePropertyValue $Money } else { $c.moneySite = $Money }
+
+$c | ConvertTo-Json -Depth 10 | Set-Content -Encoding UTF8 $cfgPath
+Write-Host "[ASD] config.json updated (site.*, author.*, legacy)."
+
+# ---- Build blog index safely (ASCII only; uses &mdash;) ----
+$posts = New-Object System.Collections.Generic.List[string]
+if (Test-Path "blog") {
+  Get-ChildItem -Path "blog" -Filter *.html -File | Where-Object { $_.Name -ne "index.html" } | ForEach-Object {
+    $html = Get-Content $_.FullName -Raw
+    $m = [regex]::Match($html, '<title>(.*?)</title>', 'IgnoreCase')
+    $title = if ($m.Success) { $m.Groups[1].Value } else { $_.BaseName }
+    $date  = $_.LastWriteTime.ToString('yyyy-MM-dd')
+    $rel   = "blog/$($_.Name)"
+    $li    = ('<li><a href="/{0}">{1}</a><small> &mdash; {2}</small></li>' -f $rel, $title, $date)
+    $posts.Add($li)
+  }
 }
-
-# ===== Process blog posts =====
-Get-ChildItem "blog\*.html" | ForEach-Object {
-    if ($_.Name -ne "index.html") {
-        Bake-File $_.FullName
-    }
-}
-
-# ===== Update config.json (optional) =====
-if (Test-Path "config.json") {
-    $c = Get-Content "config.json" -Raw | ConvertFrom-Json
-    $c.brand     = $Brand
-    $c.moneySite = $Money
-    $c | ConvertTo-Json -Depth 6 | Set-Content "config.json"
-    Write-Host "[ASD] Updated config.json"
-}
-
-# ===== Build blog index (extract <title>, use file modified date) =====
-$posts = @()
-Get-ChildItem "blog\*.html" | Where-Object { $_.Name -ne "index.html" } | ForEach-Object {
-    $content = Get-Content $_.FullName -Raw
-    $titleMatch = [regex]::Match($content, '<title>(.*?)</title>', 'IgnoreCase')
-    $title = if ($titleMatch.Success) { $titleMatch.Groups[1].Value } else { '(no title)' }
-
-    $lastWrite = $_.LastWriteTime.ToString("yyyy-MM-dd")
-    $rel = "blog/$($_.Name)"
-
-    $posts += "<li><a href='/$rel'>$title</a><small> — $lastWrite</small></li>"
-}
-
 if (Test-Path "blog/index.html") {
-    $bi = Get-Content "blog/index.html" -Raw
-    $joined = $posts -join [Environment]::NewLine
-    $bi = [regex]::Replace($bi, '(?s)<!-- POSTS_START -->.*?<!-- POSTS_END -->',
-        "<!-- POSTS_START -->`n$joined`n<!-- POSTS_END -->")
-    Set-Content "blog/index.html" $bi
-    Write-Host "[ASD] Blog index updated."
+  $bi = Get-Content "blog/index.html" -Raw
+  $joined = [string]::Join([Environment]::NewLine, $posts)
+  $pattern = '(?s)<!-- POSTS_START -->.*?<!-- POSTS_END -->'
+  $replacement = @"
+<!-- POSTS_START -->
+$joined
+<!-- POSTS_END -->
+"@
+  $bi = [regex]::Replace($bi, $pattern, $replacement)
+  Set-Content -Encoding UTF8 "blog/index.html" $bi
+  Write-Host "[ASD] Blog index updated"
 }
 
-Write-Host "[Amaterasu Static Deploy] Done."
+Write-Host "[ASD] Done."
